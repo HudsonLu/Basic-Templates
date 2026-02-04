@@ -1,8 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import type { ChangeEvent } from "react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import styles from "./page.module.css";
 
 type UploadUrlResponse = { uploadUrl: string; key: string };
@@ -12,14 +11,58 @@ export default function Home() {
   const [lastKey, setLastKey] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
-  // “Settings” UI (display only)
+  // Display-only settings (server uses .env)
   const [endpoint, setEndpoint] = useState("http://localhost:9000");
   const [bucket, setBucket] = useState("uploads");
   const [publicRead, setPublicRead] = useState(false);
 
+  // Game ID flow: draft (editable) + locked (used for uploads)
+  const [gameIdDraft, setGameIdDraft] = useState<string>("");
+  const [lockedGameId, setLockedGameId] = useState<string>("");
+
+  // To reset file input reliably
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const envHint = useMemo(() => {
-    return `S3_ENDPOINT=${endpoint}\nS3_BUCKET=${bucket}\nPUBLIC_READ=${publicRead ? "true" : "false"}`;
-  }, [endpoint, bucket, publicRead]);
+    return [
+      `S3_ENDPOINT=${endpoint}`,
+      `S3_BUCKET=${bucket}`,
+      `PUBLIC_READ=${publicRead ? "true" : "false"}`,
+      `GAME_ID=${lockedGameId || "(not set)"}`,
+    ].join("\n");
+  }, [endpoint, bucket, publicRead, lockedGameId]);
+
+  const uploadsEnabled = !!lockedGameId && !busy;
+
+  function resetFilePicker() {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function sanitizeGameId(raw: string) {
+    // keep it simple: digits only (adjust if you want UUIDs later)
+    return raw.trim().replace(/[^0-9]/g, "");
+  }
+
+  function onDone() {
+    const cleaned = sanitizeGameId(gameIdDraft);
+    if (!cleaned) {
+      setStatus("Please enter a valid Game ID (digits only).");
+      return;
+    }
+    setLockedGameId(cleaned);
+    setLastKey("");
+    resetFilePicker();
+    setStatus(`Locked to game ${cleaned}. Now select a file to upload.`);
+  }
+
+  function onEdit() {
+    setLockedGameId("");
+    setLastKey("");
+    resetFilePicker();
+    setStatus("Edit mode: set a Game ID then click Done.");
+  }
 
   async function requestUploadUrl(file: File): Promise<UploadUrlResponse> {
     const res = await fetch("/api/upload-url", {
@@ -28,8 +71,7 @@ export default function Home() {
       body: JSON.stringify({
         fileName: file.name,
         contentType: file.type || "application/octet-stream",
-        // optional: only include if your API route supports it
-        publicRead,
+        gameId: lockedGameId, // IMPORTANT: server uses this to prefix key as games/<id>/
       }),
     });
 
@@ -37,57 +79,57 @@ export default function Home() {
 
     if (!res.ok) {
       console.error("upload-url failed:", data);
-      throw new Error(data?.error || `upload-url failed (${res.status})`);
+      throw new Error(data?.error || "upload-url failed");
     }
 
     if (!data?.uploadUrl || !data?.key) {
-      console.error("Missing uploadUrl/key. Response was:", data);
-      throw new Error("Invalid /api/upload-url response (missing uploadUrl/key)");
+      console.error("Missing fields. Response was:", data);
+      throw new Error("Missing uploadUrl/key in /api/upload-url response");
     }
 
     return data as UploadUrlResponse;
   }
 
-  async function putToMinio(uploadUrl: string, file: File) {
-    const putRes = await fetch(uploadUrl, {
-      method: "PUT",
-      body: file,
-      headers: {
-        "Content-Type": file.type || "application/octet-stream",
-      },
-    });
-
-    if (!putRes.ok) {
-      const text = await putRes.text().catch(() => "");
-      console.error("PUT failed:", putRes.status, text);
-      throw new Error(`PUT to MinIO failed (${putRes.status})`);
+  async function uploadFile(file: File) {
+    if (!lockedGameId) {
+      setStatus("Set a Game ID and click Done first.");
+      return;
     }
-  }
 
-  async function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-
-    // allow selecting the same file twice (important)
-    e.target.value = "";
-
-    if (!file) return;
+    setBusy(true);
+    setStatus("Requesting pre-signed URL...");
 
     try {
-      setBusy(true);
-      setStatus("Requesting upload URL...");
-
       const { uploadUrl, key } = await requestUploadUrl(file);
 
       setStatus("Uploading to MinIO...");
-      await putToMinio(uploadUrl, file);
+      const putRes = await fetch(uploadUrl, {
+        method: "PUT",
+        body: file,
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+      });
+
+      if (!putRes.ok) {
+        const text = await putRes.text();
+        console.error("PUT failed:", putRes.status, text);
+        throw new Error(`PUT to MinIO failed (${putRes.status})`);
+      }
 
       setLastKey(key);
-      setStatus(`Uploaded ✅ (${key})`);
-    } catch (err: any) {
-      setStatus(`Upload failed ❌ ${err?.message ?? String(err)}`);
+      setStatus("Upload complete ✅");
+    } catch (e: any) {
+      setStatus(`Upload failed ❌ ${e?.message || ""}`);
     } finally {
       setBusy(false);
+      // This lets you re-upload the same file name again (browser otherwise may not fire onChange)
+      resetFilePicker();
     }
+  }
+
+  function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    uploadFile(file);
   }
 
   return (
@@ -120,7 +162,8 @@ export default function Home() {
           <div className={styles.heroText}>
             <h1 className={styles.h1}>S3-style uploads — but local.</h1>
             <p className={styles.subhead}>
-              A polished demo page for pre-signed uploads to MinIO/S3. Configure settings, upload a file, and track results.
+              Configure settings, pick a Game ID, click Done, then upload a file to MinIO
+              using a pre-signed URL.
             </p>
 
             <div className={styles.heroStats}>
@@ -133,8 +176,8 @@ export default function Home() {
                 <div className={styles.statValue}>{bucket}</div>
               </div>
               <div className={styles.statCard}>
-                <div className={styles.statLabel}>Endpoint</div>
-                <div className={styles.statValue}>{new URL(endpoint).host}</div>
+                <div className={styles.statLabel}>Game</div>
+                <div className={styles.statValue}>{lockedGameId || "—"}</div>
               </div>
             </div>
 
@@ -142,7 +185,12 @@ export default function Home() {
               <a className={styles.primaryBtn} href="#upload">
                 Start upload
               </a>
-              <a className={styles.secondaryBtn} href="http://localhost:9001" target="_blank" rel="noreferrer">
+              <a
+                className={styles.secondaryBtn}
+                href="http://localhost:9001"
+                target="_blank"
+                rel="noreferrer"
+              >
                 Open MinIO Console
               </a>
             </div>
@@ -165,27 +213,43 @@ export default function Home() {
           <div className={styles.card}>
             <div className={styles.cardHeader}>
               <h2 className={styles.h2}>Settings</h2>
-              <p className={styles.muted}>Adjust display settings (optional). Your API route can also use these later.</p>
+              <p className={styles.muted}>
+                Pick a Game ID and click Done. Uploads will go into{" "}
+                <code>games/&lt;gameId&gt;/</code>.
+              </p>
             </div>
 
             <div className={styles.formGrid}>
               <label className={styles.label}>
-                <span>Endpoint</span>
+                <span>Endpoint (display)</span>
                 <input
                   className={styles.input}
                   value={endpoint}
-                  onChange={(ev) => setEndpoint(ev.target.value)}
+                  onChange={(e) => setEndpoint(e.target.value)}
                   placeholder="http://localhost:9000"
+                  disabled={!!lockedGameId}
                 />
               </label>
 
               <label className={styles.label}>
-                <span>Bucket</span>
+                <span>Bucket (display)</span>
                 <input
                   className={styles.input}
                   value={bucket}
-                  onChange={(ev) => setBucket(ev.target.value)}
+                  onChange={(e) => setBucket(e.target.value)}
                   placeholder="uploads"
+                  disabled={!!lockedGameId}
+                />
+              </label>
+
+              <label className={styles.label}>
+                <span>Game ID</span>
+                <input
+                  className={styles.input}
+                  value={gameIdDraft}
+                  onChange={(e) => setGameIdDraft(e.target.value)}
+                  placeholder="e.g. 3"
+                  disabled={!!lockedGameId}
                 />
               </label>
 
@@ -193,10 +257,21 @@ export default function Home() {
                 <input
                   type="checkbox"
                   checked={publicRead}
-                  onChange={(ev) => setPublicRead(ev.target.checked)}
+                  onChange={(e) => setPublicRead(e.target.checked)}
+                  disabled={!!lockedGameId}
                 />
                 <span>Public read (demo toggle)</span>
               </label>
+
+              {!!lockedGameId ? (
+                <button className={styles.secondaryBtn} type="button" onClick={onEdit}>
+                  Edit
+                </button>
+              ) : (
+                <button className={styles.primaryBtn} type="button" onClick={onDone}>
+                  Done
+                </button>
+              )}
             </div>
           </div>
 
@@ -204,23 +279,30 @@ export default function Home() {
           <div id="upload" className={styles.card}>
             <div className={styles.cardHeader}>
               <h2 className={styles.h2}>Upload</h2>
-              <p className={styles.muted}>Generates a pre-signed URL and uploads directly to storage.</p>
+              <p className={styles.muted}>
+                {lockedGameId
+                  ? `Uploads go to folder: games/${lockedGameId}/`
+                  : "Uploads are disabled until you set a Game ID and click Done."}
+              </p>
             </div>
 
             <div className={styles.uploadBox}>
               <div className={styles.uploadLeft}>
                 <div className={styles.uploadTitle}>Choose a file</div>
-                <div className={styles.uploadDesc}>Images, PDFs, anything — sent via PUT to your pre-signed URL.</div>
+                <div className={styles.uploadDesc}>
+                  Images, PDFs, anything — sent via PUT to your pre-signed URL.
+                </div>
               </div>
 
               <div className={styles.uploadRight}>
-                <label className={styles.fileBtn}>
+                <label className={styles.fileBtn} aria-disabled={!uploadsEnabled}>
                   {busy ? "Uploading..." : "Select file"}
                   <input
+                    ref={fileInputRef}
                     className={styles.fileInput}
                     type="file"
-                    onChange={handleFileChange}
-                    disabled={busy}
+                    onChange={onPickFile}
+                    disabled={!uploadsEnabled}
                   />
                 </label>
                 <div className={styles.smallHint}>Max size depends on your backend validation.</div>
