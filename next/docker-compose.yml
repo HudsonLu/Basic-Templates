@@ -4,29 +4,61 @@ services:
     container_name: minio
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # Console UI
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console UI
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     restart: unless-stopped
 
   minio_init:
     image: minio/mc:latest
     container_name: minio_init
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      echo 'Waiting for MinIO...';
-      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do sleep 1; done;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
       mc mb -p local/uploads || true;
       mc anonymous set none local/uploads || true;
       echo 'MinIO bucket initialized';
       "
     restart: "no"
+
+  nextjs:
+    image: node:20-alpine
+    container_name: nextjs
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./:/app
+    environment:
+      # Server-side S3 SDK config (inside Docker):
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_REGION: us-east-1
+      S3_BUCKET: uploads
+      S3_FORCE_PATH_STYLE: "true"
+      S3_ENDPOINT: http://localhost:9000
+      NEXT_PUBLIC_S3_PUBLIC_ENDPOINT: http://localhost:9000
+      NEXT_PUBLIC_S3_PUBLIC_BUCKET: uploads
+
+    depends_on:
+      minio_init:
+        condition: service_completed_successfully
+    command: sh -c "npm install && npm run dev"
+    restart: unless-stopped
 
 volumes:
   minio_data:
